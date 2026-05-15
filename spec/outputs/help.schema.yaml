@@ -1,0 +1,30 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+required: [tool, summary, usage, flags, commands, schemas]
+additionalProperties: false
+properties:
+  tool: {const: xmpp}
+  summary: {type: string, minLength: 1}
+  usage: {type: string, minLength: 1}
+  flags:
+    type: array
+    items:
+      type: object
+      required: [name, summary]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1}
+        summary: {type: string, minLength: 1}
+  commands:
+    type: array
+    items:
+      type: object
+      required: [name, summary, schema]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1}
+        summary: {type: string, minLength: 1}
+        schema: {type: string, minLength: 1}
+  schemas:
+    type: array
+    items: {type: string, minLength: 1}

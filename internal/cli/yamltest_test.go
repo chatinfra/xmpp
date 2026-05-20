@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,53 @@ func requireYAMLStdout(t *testing.T, stdout, stderr, schemaPath string) any {
 	return doc
 }
 
+func requireYAMLStreamStdout(t *testing.T, stdout, stderr, schemaPath string) []any {
+	t.Helper()
+	if strings.TrimSpace(stdout) == "" {
+		t.Fatalf("stdout is empty; want YAML stream output")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty stderr for success", stderr)
+	}
+	docs := decodeYAMLStream(t, stdout)
+	for _, doc := range docs {
+		validateYAMLSchema(t, doc, schemaPath)
+	}
+	return docs
+}
+
+func TestListenOutputSchemaAndDiscovery(t *testing.T) {
+	docs := decodeYAMLStream(t, "from: bob@example.test\nbody: first\n---\nto: alice@example.test/mobile\ntype: chat\nbody: second\n")
+	if len(docs) != 2 {
+		t.Fatalf("documents = %d; want 2", len(docs))
+	}
+	for _, doc := range docs {
+		validateYAMLSchema(t, doc, "listen.schema.yaml")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := Run([]string{"schemas"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	schemasDoc := requireYAMLStdout(t, stdout.String(), stderr.String(), "schemas.schema.yaml")
+	if !hasSchemaEntry(t, schemasDoc, "listen", "spec/outputs/listen.schema.yaml") {
+		t.Fatalf("schemas output missing listen entry: %#v", schemasDoc)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := Run([]string{"help"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	helpDoc := requireYAMLStdout(t, stdout.String(), stderr.String(), "help.schema.yaml")
+	if !hasCommandEntry(t, helpDoc, "listen", "listen") {
+		t.Fatalf("help output missing listen command: %#v", helpDoc)
+	}
+	if !hasSchemaID(t, helpDoc, "listen") {
+		t.Fatalf("help output missing listen schema id: %#v", helpDoc)
+	}
+}
+
 func requireYAMLError(t *testing.T, stdout, stderr, schemaPath string) any {
 	t.Helper()
 	if stdout != "" {
@@ -48,6 +97,89 @@ func decodeYAML(t *testing.T, raw string) any {
 		t.Fatalf("YAML invalid: %v\n%s", err, raw)
 	}
 	return normalizeYAML(value)
+}
+
+func decodeYAMLStream(t *testing.T, raw string) []any {
+	t.Helper()
+	decoder := yaml.NewDecoder(strings.NewReader(raw))
+	var docs []any
+	for {
+		var value any
+		err := decoder.Decode(&value)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("YAML stream invalid: %v\n%s", err, raw)
+		}
+		if value == nil {
+			continue
+		}
+		docs = append(docs, normalizeYAML(value))
+	}
+	return docs
+}
+
+func hasSchemaEntry(t *testing.T, doc any, id, path string) bool {
+	t.Helper()
+	root, ok := doc.(map[string]any)
+	if !ok {
+		t.Fatalf("schemas doc = %#v; want map", doc)
+	}
+	schemas, ok := root["schemas"].([]any)
+	if !ok {
+		t.Fatalf("schemas field = %#v; want list", root["schemas"])
+	}
+	for _, item := range schemas {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("schema entry = %#v; want map", item)
+		}
+		if entry["id"] == id && entry["path"] == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCommandEntry(t *testing.T, doc any, name, schema string) bool {
+	t.Helper()
+	root, ok := doc.(map[string]any)
+	if !ok {
+		t.Fatalf("help doc = %#v; want map", doc)
+	}
+	commands, ok := root["commands"].([]any)
+	if !ok {
+		t.Fatalf("commands field = %#v; want list", root["commands"])
+	}
+	for _, item := range commands {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("command entry = %#v; want map", item)
+		}
+		if entry["name"] == name && entry["schema"] == schema {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSchemaID(t *testing.T, doc any, id string) bool {
+	t.Helper()
+	root, ok := doc.(map[string]any)
+	if !ok {
+		t.Fatalf("help doc = %#v; want map", doc)
+	}
+	schemas, ok := root["schemas"].([]any)
+	if !ok {
+		t.Fatalf("schemas field = %#v; want list", root["schemas"])
+	}
+	for _, item := range schemas {
+		if item == id {
+			return true
+		}
+	}
+	return false
 }
 
 func validateYAMLSchema(t *testing.T, doc any, schemaPath string) {

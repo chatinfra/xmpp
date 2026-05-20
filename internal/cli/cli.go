@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -39,6 +41,10 @@ type errorEnvelope struct {
 	Error commandError `json:"error"`
 }
 
+var listenSignalContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+}
+
 func Run(args []string, stdout, stderr io.Writer) error {
 	if err := rejectJSONFlag(args); err != nil {
 		emitError(stderr, options{}, err)
@@ -62,7 +68,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	cmd := rest[0]
-	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
+	ctx, cancel := commandContext(cmd, opts.timeout)
 	defer cancel()
 
 	client, err := newClient(opts)
@@ -71,6 +77,9 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if err := client.Connect(ctx); err != nil {
+		if commandCancelledCleanly(cmd, ctx) {
+			return nil
+		}
 		emitError(stderr, opts, err)
 		return err
 	}
@@ -80,11 +89,36 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if err := runCommand(ctx, client, opts, cmd, rest[1:], stdout); err != nil {
+		if commandCancelledCleanly(cmd, ctx) {
+			return nil
+		}
 		emitError(stderr, opts, err)
 		return err
 	}
 	return nil
 }
+
+func commandContext(cmd string, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx := context.Background()
+	cancel := func() {}
+	if isListenCommand(cmd) {
+		ctx, cancel = listenSignalContext(ctx)
+	}
+	if !isListenCommand(cmd) || timeout > 0 {
+		deadlineCtx, deadlineCancel := context.WithTimeout(ctx, timeout)
+		return deadlineCtx, func() {
+			deadlineCancel()
+			cancel()
+		}
+	}
+	return ctx, cancel
+}
+
+func commandCancelledCleanly(cmd string, ctx context.Context) bool {
+	return isListenCommand(cmd) && ctx.Err() != nil
+}
+
+func isListenCommand(cmd string) bool { return cmd == "listen" }
 
 func rejectJSONFlag(args []string) error {
 	for _, arg := range args {
@@ -96,7 +130,7 @@ func rejectJSONFlag(args []string) error {
 }
 
 func schemaDiscovery() map[string]any {
-	ids := []string{"help", "schemas", "error", "connect", "send", "recv", "ping"}
+	ids := []string{"help", "schemas", "error", "connect", "send", "recv", "listen", "ping"}
 	schemas := make([]map[string]string, 0, len(ids))
 	for _, id := range ids {
 		schemas = append(schemas, map[string]string{"id": id, "path": "spec/outputs/" + id + ".schema.yaml"})
@@ -173,6 +207,17 @@ func runCommand(ctx context.Context, client *xmpp.Client, opts options, cmd stri
 			return err
 		}
 		return write(out, false, msg, renderMessage(msg))
+	case "listen":
+		first := true
+		return client.StreamMessages(ctx, func(msg *xmpp.Message) error {
+			if !first {
+				if _, err := io.WriteString(out, "---\n"); err != nil {
+					return err
+				}
+			}
+			first = false
+			return writeYAML(out, msg)
+		})
 	case "ping":
 		to := opts.to
 		if len(args) > 0 {
@@ -262,9 +307,10 @@ func printUsage(out io.Writer) error {
 			{"name": "connect", "summary": "connect, authenticate, bind resource, then exit", "schema": "connect"},
 			{"name": "send", "summary": "send a chat message", "schema": "send"},
 			{"name": "recv", "summary": "wait for one message with a non-empty body", "schema": "recv"},
+			{"name": "listen", "summary": "stream messages with non-empty bodies until timeout or signal", "schema": "listen"},
 			{"name": "ping", "summary": "send XEP-0199 ping", "schema": "ping"},
 			{"name": "schemas", "summary": "list output schemas", "schema": "schemas"},
 		},
-		"schemas": []string{"help", "schemas", "error", "connect", "send", "recv", "ping"},
+		"schemas": []string{"help", "schemas", "error", "connect", "send", "recv", "listen", "ping"},
 	})
 }

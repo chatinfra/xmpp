@@ -230,7 +230,7 @@ func (c *Client) ReceiveMessage(ctx context.Context) (*Message, error) {
 			return nil, ctx.Err()
 		default:
 		}
-		tok, err := c.decoder.Token()
+		tok, err := c.receiveToken(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -246,6 +246,64 @@ func (c *Client) ReceiveMessage(ctx context.Context) (*Message, error) {
 			return &msg, nil
 		}
 	}
+}
+
+func (c *Client) StreamMessages(ctx context.Context, yield func(*Message) error) error {
+	for {
+		msg, err := c.ReceiveMessage(ctx)
+		if err != nil {
+			if receiveEndedByContext(ctx, err) {
+				return nil
+			}
+			return err
+		}
+		if err := yield(msg); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) receiveToken(ctx context.Context) (xml.Token, error) {
+	if c.conn == nil {
+		return c.decoder.Token()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.conn.SetReadDeadline(deadline)
+	} else {
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}
+	done := make(chan struct{})
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = c.conn.SetReadDeadline(time.Now())
+			case <-done:
+			}
+		}()
+		defer close(done)
+	}
+	tok, err := c.decoder.Token()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return nil, context.DeadlineExceeded
+		}
+	}
+	return tok, err
+}
+
+func receiveEndedByContext(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 func (c *Client) openStream() error {

@@ -17,6 +17,7 @@ type responseState struct {
 type messageState struct {
 	messageID string
 	textByID  map[string]string
+	partType  map[string]string
 	partOrder []string
 	text      string
 }
@@ -80,10 +81,6 @@ func (s *responseState) observePartUpdated(properties map[string]any) {
 	if !ok {
 		return
 	}
-	partType, _ := stringValue(part["type"])
-	if partType != "text" {
-		return
-	}
 	messageID, ok := stringValue(part["messageID"])
 	if !ok || messageID == "" {
 		return
@@ -92,10 +89,19 @@ func (s *responseState) observePartUpdated(properties map[string]any) {
 	if !ok || partID == "" {
 		return
 	}
-	text, _ := stringValue(part["text"])
+	partType, _ := stringValue(part["type"])
 	msg := s.message(messageID)
+	msg.partType[partID] = partType
+	if partType != "text" {
+		msg.rebuildText()
+		return
+	}
 	msg.notePart(partID)
-	msg.textByID[partID] = text
+	if text, ok := stringValue(part["text"]); ok {
+		msg.textByID[partID] = text
+	} else if _, exists := msg.textByID[partID]; !exists {
+		msg.textByID[partID] = ""
+	}
 	msg.rebuildText()
 }
 
@@ -130,7 +136,7 @@ func (s *responseState) observeMessageUpdated(properties map[string]any) (Assist
 func (s *responseState) message(messageID string) *messageState {
 	msg := s.messages[messageID]
 	if msg == nil {
-		msg = &messageState{messageID: messageID, textByID: map[string]string{}}
+		msg = &messageState{messageID: messageID, textByID: map[string]string{}, partType: map[string]string{}}
 		s.messages[messageID] = msg
 	}
 	return msg
@@ -143,6 +149,9 @@ func (m *messageState) rebuildText() {
 	}
 	var b strings.Builder
 	for _, partID := range m.partOrder {
+		if m.partType[partID] != "text" {
+			continue
+		}
 		text := m.textByID[partID]
 		b.WriteString(text)
 	}

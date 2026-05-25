@@ -18,6 +18,15 @@ import (
 
 const DefaultPort = 5222
 
+const chatStateNamespace = "http://jabber.org/protocol/chatstates"
+
+type ChatState string
+
+const (
+	ChatStateActive    ChatState = "active"
+	ChatStateComposing ChatState = "composing"
+)
+
 type Config struct {
 	Host      string
 	Port      int
@@ -196,6 +205,24 @@ func (c *Client) SendMessage(to, body string) error {
 	stanza := fmt.Sprintf("<message to='%s' type='chat'><body>%s</body></message>", xmlEscape(to), xmlEscape(body))
 	_, err := io.WriteString(c.conn, stanza)
 	return err
+}
+
+func (c *Client) SendChatState(to string, state ChatState) error {
+	if !state.valid() {
+		return fmt.Errorf("unsupported xmpp chat state %q", state)
+	}
+	stanza := fmt.Sprintf("<message to='%s' type='chat'><%s xmlns='%s'/></message>", xmlEscape(to), state, chatStateNamespace)
+	_, err := io.WriteString(c.conn, stanza)
+	return err
+}
+
+func (s ChatState) valid() bool {
+	switch s {
+	case ChatStateActive, ChatStateComposing:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) Ping(ctx context.Context, to string) (*PingResult, error) {

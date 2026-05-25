@@ -237,6 +237,51 @@ func TestBridgeStatusReflectsConnectedAndReplyTimestamps(t *testing.T) {
 	}
 }
 
+func TestBridgeSendsChatStatesAroundSuccessfulPrompt(t *testing.T) {
+	stateDir := t.TempDir()
+	x := &fakeXMPP{messages: []*xmpp.Message{{From: "bob@example.com/phone", Body: "hello"}}}
+	oc := newFakeOpencode("ses-1")
+	bridge := testBridge(stateDir, x, oc)
+	if err := bridge.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"state:bob@example.com/phone:active",
+		"state:bob@example.com/phone:composing",
+		"message:bob@example.com/phone:reply:hello",
+		"state:bob@example.com/phone:active",
+	}
+	if got := x.operations(); !equalStrings(got, want) {
+		t.Fatalf("operations=%v, want %v", got, want)
+	}
+}
+
+func TestBridgeClearsChatStateOnOpencodeError(t *testing.T) {
+	stateDir := t.TempDir()
+	x := &fakeXMPP{messages: []*xmpp.Message{{From: "bob@example.com/phone", Body: "hello"}}}
+	oc := newFakeOpencode("ses-1")
+	oc.promptFunc = func(context.Context, string, string) (opencode.AssistantResponse, error) {
+		return opencode.AssistantResponse{}, errors.New("opencode boom")
+	}
+	bridge := testBridge(stateDir, x, oc)
+	if err := bridge.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if sent := x.sentMessages(); len(sent) != 0 {
+		t.Fatalf("sent replies=%+v", sent)
+	}
+	want := []string{
+		"state:bob@example.com/phone:active",
+		"state:bob@example.com/phone:composing",
+		"state:bob@example.com/phone:active",
+	}
+	if got := x.operations(); !equalStrings(got, want) {
+		t.Fatalf("operations=%v, want %v", got, want)
+	}
+}
+
 func testBridge(stateDir string, x *fakeXMPP, oc *fakeOpencode) *Bridge {
 	return NewBridgeWithClients(testConfig(stateDir), log.New(&bytes.Buffer{}, "", 0), x, oc)
 }
@@ -253,15 +298,22 @@ func testConfig(stateDir string) Config {
 }
 
 type fakeXMPP struct {
+	mu                sync.Mutex
 	messages          []*xmpp.Message
 	blockUntilContext bool
 	connected         bool
 	presence          bool
 	closed            bool
 	sent              []sentMessage
+	states            []sentChatState
+	ops               []string
 }
 
 type sentMessage struct{ to, body string }
+type sentChatState struct {
+	to    string
+	state xmpp.ChatState
+}
 
 func (f *fakeXMPP) Connect(context.Context) error {
 	f.connected = true
@@ -286,13 +338,48 @@ func (f *fakeXMPP) StreamMessages(ctx context.Context, yield func(*xmpp.Message)
 }
 
 func (f *fakeXMPP) SendMessage(to, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sent = append(f.sent, sentMessage{to: to, body: body})
+	f.ops = append(f.ops, "message:"+to+":"+body)
+	return nil
+}
+
+func (f *fakeXMPP) SendChatState(to string, state xmpp.ChatState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states = append(f.states, sentChatState{to: to, state: state})
+	f.ops = append(f.ops, "state:"+to+":"+string(state))
 	return nil
 }
 
 func (f *fakeXMPP) Close() error {
 	f.closed = true
 	return nil
+}
+
+func (f *fakeXMPP) sentMessages() []sentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentMessage(nil), f.sent...)
+}
+
+func (f *fakeXMPP) operations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type fakeOpencode struct {

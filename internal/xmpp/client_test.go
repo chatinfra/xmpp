@@ -66,6 +66,67 @@ func TestPlaintextConnectSendAndReceive(t *testing.T) {
 	}
 }
 
+func TestSendChatStateActive(t *testing.T) {
+	stanza := captureClientWrite(t, func(client *Client) error {
+		return client.SendChatState("bob@example.com/mobile", ChatStateActive)
+	})
+
+	if !strings.Contains(stanza, "<message to='bob@example.com/mobile' type='chat'>") {
+		t.Fatalf("stanza missing message wrapper: %s", stanza)
+	}
+	if !strings.Contains(stanza, "<active xmlns='http://jabber.org/protocol/chatstates'/>") {
+		t.Fatalf("stanza missing active chat state: %s", stanza)
+	}
+	if strings.Contains(stanza, "<body>") {
+		t.Fatalf("chat-state stanza should not include body: %s", stanza)
+	}
+}
+
+func TestSendChatStateComposingEscapesDestination(t *testing.T) {
+	stanza := captureClientWrite(t, func(client *Client) error {
+		return client.SendChatState("bob@example.com/mobile&<unsafe>", ChatStateComposing)
+	})
+
+	if !strings.Contains(stanza, "to='bob@example.com/mobile&amp;&lt;unsafe&gt;'") {
+		t.Fatalf("stanza did not escape destination JID: %s", stanza)
+	}
+	if !strings.Contains(stanza, "<composing xmlns='http://jabber.org/protocol/chatstates'/>") {
+		t.Fatalf("stanza missing composing chat state: %s", stanza)
+	}
+}
+
+func captureClientWrite(t *testing.T, write func(*Client) error) string {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	readDone := make(chan struct {
+		stanza string
+		err    error
+	}, 1)
+	go func() {
+		stanza, err := readUntilString(bufio.NewReader(serverConn), "</message>")
+		readDone <- struct {
+			stanza string
+			err    error
+		}{stanza: stanza, err: err}
+	}()
+	client := &Client{conn: clientConn}
+	if err := write(client); err != nil {
+		t.Fatalf("write stanza: %v", err)
+	}
+	select {
+	case result := <-readDone:
+		if result.err != nil {
+			t.Fatalf("read stanza: %v", result.err)
+		}
+		return result.stanza
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stanza")
+	}
+	return ""
+}
+
 func fakeServer(conn net.Conn, done chan<- error, t *testing.T) {
 	t.Helper()
 	defer conn.Close()
@@ -131,16 +192,24 @@ func fakeServer(conn net.Conn, done chan<- error, t *testing.T) {
 var lastRead string
 
 func readUntil(reader *bufio.Reader, marker string) error {
+	value, err := readUntilString(reader, marker)
+	if err != nil {
+		return err
+	}
+	lastRead = value
+	return nil
+}
+
+func readUntilString(reader *bufio.Reader, marker string) (string, error) {
 	var b strings.Builder
 	for {
 		r, _, err := reader.ReadRune()
 		if err != nil {
-			return err
+			return "", err
 		}
 		b.WriteRune(r)
 		if strings.Contains(b.String(), marker) {
-			lastRead = b.String()
-			return nil
+			return b.String(), nil
 		}
 	}
 }

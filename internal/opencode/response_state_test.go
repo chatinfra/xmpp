@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+func TestResponseStateWaitsThroughToolCallsFinish(t *testing.T) {
+	response := observeResponse(t, "ses-1", []string{
+		`{"type":"message.updated","properties":{"sessionID":"ses-1","info":{"id":"msg-tool","sessionID":"ses-1","role":"assistant","finish":"tool-calls","time":{"created":1,"completed":2}}}}`,
+		`{"type":"message.part.updated","properties":{"sessionID":"ses-1","part":{"id":"text-1","sessionID":"ses-1","messageID":"msg-final","type":"text"}}}`,
+		`{"type":"message.part.delta","properties":{"sessionID":"ses-1","messageID":"msg-final","partID":"text-1","field":"text","delta":"Final "}}`,
+		`{"type":"message.part.delta","properties":{"sessionID":"ses-1","messageID":"msg-final","partID":"text-1","field":"text","delta":"answer"}}`,
+		`{"type":"message.updated","properties":{"sessionID":"ses-1","info":{"id":"msg-final","sessionID":"ses-1","role":"assistant","finish":"stop","time":{"created":3,"completed":4}}}}`,
+	})
+
+	if response.MessageID != "msg-final" || response.Text != "Final answer" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestResponseStateWaitsThroughToolCallsUnderscoreFinish(t *testing.T) {
+	response := observeResponse(t, "ses-1", []string{
+		`{"type":"message.updated","properties":{"sessionID":"ses-1","info":{"id":"msg-tool","sessionID":"ses-1","role":"assistant","finish":"tool_calls","time":{"created":1,"completed":2}}}}`,
+		`{"type":"message.updated","properties":{"sessionID":"ses-1","info":{"id":"msg-final","sessionID":"ses-1","role":"assistant","finish":"stop","content":[{"type":"text","text":"done"}],"time":{"created":3,"completed":4}}}}`,
+	})
+
+	if response.MessageID != "msg-final" || response.Text != "done" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func TestResponseStateExcludesReasoningParts(t *testing.T) {
 	response := observeResponse(t, "ses-1", []string{
 		`{"type":"message.part.updated","properties":{"sessionID":"ses-1","part":{"id":"reason-1","sessionID":"ses-1","messageID":"msg-1","type":"reasoning","text":"internal plan "}}}`,
@@ -44,6 +69,18 @@ func TestResponseStateExcludesReasoningDeltasBeforePartUpdate(t *testing.T) {
 		if strings.Contains(response.Text, forbidden) {
 			t.Fatalf("Text=%q contains reasoning content %q", response.Text, forbidden)
 		}
+	}
+}
+
+func TestResponseStateTerminalEmptyTextIsError(t *testing.T) {
+	state := newResponseState("ses-1")
+	_, done, err := state.Observe([]byte(`{"type":"message.updated","properties":{"sessionID":"ses-1","info":{"id":"msg-empty","sessionID":"ses-1","role":"assistant","finish":"stop","time":{"created":1,"completed":2}}}}`))
+
+	if done {
+		t.Fatal("empty terminal response unexpectedly completed")
+	}
+	if err == nil || err.Error() != "opencode assistant response completed without text" {
+		t.Fatalf("err=%v, want completed without text", err)
 	}
 }
 

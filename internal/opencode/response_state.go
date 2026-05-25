@@ -227,12 +227,21 @@ func isAssistantMessage(info map[string]any) bool {
 
 func assistantCompleted(info map[string]any) bool {
 	if finish, ok := stringValue(info["finish"]); ok && finish != "" {
-		return true
+		return !isToolCallFinish(finish)
 	}
 	if timeObj, ok := objectValue(info["time"]); ok && hasNonNil(timeObj, "completed") {
 		return true
 	}
 	return false
+}
+
+func isToolCallFinish(finish string) bool {
+	switch strings.TrimSpace(strings.ToLower(finish)) {
+	case "tool-calls", "tool_calls":
+		return true
+	default:
+		return false
+	}
 }
 
 func extractAssistantText(info map[string]any) string {

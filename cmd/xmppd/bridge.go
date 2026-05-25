@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	sessionRetryInitialDelay = time.Second
-	sessionRetryMaxElapsed   = 2 * time.Minute
+	sessionRetryInitialDelay       = time.Second
+	sessionRetryMaxElapsed         = 2 * time.Minute
+	chatStateComposingRefreshEvery = 20 * time.Second
 )
 
 type xmppConn interface {
@@ -23,6 +24,7 @@ type xmppConn interface {
 	SendPresence() error
 	StreamMessages(context.Context, func(*xmpp.Message) error) error
 	SendMessage(to, body string) error
+	SendChatState(to string, state xmpp.ChatState) error
 	Close() error
 }
 
@@ -193,6 +195,13 @@ func (b *Bridge) runWorker(ctx context.Context, worker *sessionWorker) {
 }
 
 func (b *Bridge) processMessage(ctx context.Context, msg inboundMessage) {
+	b.sendChatState(msg.FullJID, xmpp.ChatStateActive)
+	stopComposing := b.startComposingLoop(ctx, msg.FullJID)
+	defer func() {
+		stopComposing()
+		b.sendChatState(msg.FullJID, xmpp.ChatStateActive)
+	}()
+
 	sessionID, err := b.sessionForWithRetry(ctx, msg.BareJID)
 	if err != nil {
 		b.logOnlyError("create session", err)
@@ -223,6 +232,35 @@ func (b *Bridge) processMessage(ctx context.Context, msg inboundMessage) {
 	b.status.LastReplyAt = &now
 	b.mu.Unlock()
 	b.flushStatus()
+}
+
+func (b *Bridge) startComposingLoop(ctx context.Context, to string) func() {
+	b.sendChatState(to, xmpp.ChatStateComposing)
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(chatStateComposingRefreshEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+				b.sendChatState(to, xmpp.ChatStateComposing)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (b *Bridge) sendChatState(to string, state xmpp.ChatState) {
+	if err := b.xmpp.SendChatState(to, state); err != nil {
+		b.recordError(fmt.Errorf("send xmpp chat state %s: %w", state, err))
+	}
 }
 
 func (b *Bridge) sessionFor(ctx context.Context, bare string) (string, error) {

@@ -81,6 +81,26 @@ func IsStaleSession(err error) bool {
 	return errors.As(err, &stale)
 }
 
+func IsSessionInvalid(err error) bool {
+	if IsStaleSession(err) {
+		return true
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	if httpErr.Method != http.MethodPost || !isSessionMessagePath(httpErr.Path) {
+		return false
+	}
+	if isStaleSessionHTTPError(err) {
+		return true
+	}
+	if httpErr.StatusCode != http.StatusInternalServerError {
+		return false
+	}
+	return strings.Contains(strings.ToLower(httpErr.Body), "unknownerror")
+}
+
 func New(cfg Config) (*Client, error) {
 	base := strings.TrimSpace(cfg.BaseURL)
 	if base == "" {
@@ -397,6 +417,12 @@ func isStaleSessionHTTPError(err error) bool {
 	return (httpErr.StatusCode == http.StatusBadRequest || httpErr.StatusCode == http.StatusConflict) &&
 		strings.Contains(body, "session") &&
 		(strings.Contains(body, "stale") || strings.Contains(body, "not found") || strings.Contains(body, "missing") || strings.Contains(body, "deleted") || strings.Contains(body, "invalid"))
+}
+
+func isSessionMessagePath(path string) bool {
+	path, _, _ = strings.Cut(path, "?")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	return len(parts) == 3 && parts[0] == "session" && parts[1] != "" && parts[2] == "message"
 }
 
 func scanSSE(r io.Reader, fn func(SSEEvent) error) error {

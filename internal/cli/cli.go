@@ -33,6 +33,7 @@ type options struct {
 type commandError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Hint    string `json:"hint,omitempty"`
 }
 
 func (e commandError) Error() string { return e.Message }
@@ -50,7 +51,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		emitError(stderr, options{}, err)
 		return err
 	}
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+	if len(args) == 0 || (len(args) == 1 && isHelpFlag(args[0])) {
 		return printUsage(stdout)
 	}
 	opts, rest, err := parse(args)
@@ -61,6 +62,12 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if len(rest) == 0 {
 		err := coded("missing_command", "missing command")
 		emitError(stderr, opts, err)
+		return err
+	}
+	if handled, err := handleHelp(rest, stdout); handled {
+		if err != nil {
+			emitError(stderr, opts, err)
+		}
 		return err
 	}
 	if rest[0] == "schemas" || rest[0] == "schema" {
@@ -98,6 +105,33 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+func handleHelp(rest []string, stdout io.Writer) (bool, error) {
+	if len(rest) == 0 {
+		return true, printUsage(stdout)
+	}
+	if rest[0] == "help" {
+		if len(rest) == 1 {
+			return true, printUsage(stdout)
+		}
+		return true, printCommandHelp(stdout, rest[1])
+	}
+	if hasHelpFlag(rest[1:]) {
+		return true, printCommandHelp(stdout, rest[0])
+	}
+	return false, nil
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if isHelpFlag(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHelpFlag(arg string) bool { return arg == "--help" || arg == "-h" }
+
 func commandContext(cmd string, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx := context.Background()
 	cancel := func() {}
@@ -130,12 +164,16 @@ func rejectJSONFlag(args []string) error {
 }
 
 func schemaDiscovery() map[string]any {
-	ids := []string{"help", "schemas", "error", "connect", "send", "recv", "listen", "ping"}
+	ids := []string{"schemas", "error", "connect", "send", "recv", "listen", "ping"}
+	return map[string]any{"tool": "xmpp", "schemas": schemaEntries(ids...)}
+}
+
+func schemaEntries(ids ...string) []map[string]string {
 	schemas := make([]map[string]string, 0, len(ids))
 	for _, id := range ids {
 		schemas = append(schemas, map[string]string{"id": id, "path": "spec/outputs/" + id + ".schema.yaml"})
 	}
-	return map[string]any{"tool": "xmpp", "schemas": schemas}
+	return schemas
 }
 
 func parse(args []string) (options, []string, error) {
@@ -174,7 +212,7 @@ func newClient(opts options) (*xmpp.Client, error) {
 func runCommand(ctx context.Context, client *xmpp.Client, opts options, cmd string, args []string, out io.Writer) error {
 	switch cmd {
 	case "connect", "login":
-		return write(out, false, map[string]any{"connected": true}, "connected and authenticated\n")
+		return writeYAMLResult(out, map[string]any{"connected": true})
 	case "send":
 		to := opts.to
 		body := opts.body
@@ -200,13 +238,13 @@ func runCommand(ctx context.Context, client *xmpp.Client, opts options, cmd stri
 		if err := client.SendMessage(to, body); err != nil {
 			return err
 		}
-		return write(out, false, map[string]any{"sent": true, "to": to}, fmt.Sprintf("sent message to %s\n", to))
+		return writeYAMLResult(out, map[string]any{"sent": true, "to": to})
 	case "recv", "receive":
 		msg, err := client.ReceiveMessage(ctx)
 		if err != nil {
 			return err
 		}
-		return write(out, false, msg, renderMessage(msg))
+		return writeYAMLResult(out, msg)
 	case "listen":
 		first := true
 		return client.StreamMessages(ctx, func(msg *xmpp.Message) error {
@@ -227,13 +265,13 @@ func runCommand(ctx context.Context, client *xmpp.Client, opts options, cmd stri
 		if err != nil {
 			return err
 		}
-		return write(out, false, result, fmt.Sprintf("ping id=%s ok=%t\n", result.ID, result.OK))
+		return writeYAMLResult(out, result)
 	default:
 		return coded("unknown_command", fmt.Sprintf("unknown command %q", cmd))
 	}
 }
 
-func write(out io.Writer, asJSON bool, value any, human string) error {
+func writeYAMLResult(out io.Writer, value any) error {
 	return writeYAML(out, value)
 }
 
@@ -261,12 +299,16 @@ func emitError(stderr io.Writer, opts options, err error) {
 	ce := commandError{Code: "command_failed", Message: redact(err.Error(), opts.password)}
 	var codedErr commandError
 	if errors.As(err, &codedErr) {
-		ce = commandError{Code: codedErr.Code, Message: redact(codedErr.Message, opts.password)}
+		ce = commandError{Code: codedErr.Code, Message: redact(codedErr.Message, opts.password), Hint: redact(codedErr.Hint, opts.password)}
 	}
 	_ = writeYAML(stderr, errorEnvelope{Error: ce})
 }
 
 func coded(code, message string) error { return commandError{Code: code, Message: message} }
+
+func codedWithHint(code, message, hint string) error {
+	return commandError{Code: code, Message: message, Hint: hint}
+}
 
 func redact(message, secret string) string {
 	if secret == "" {
@@ -287,30 +329,174 @@ func emptyDash(v string) string {
 }
 
 func printUsage(out io.Writer) error {
-	return writeYAML(out, map[string]any{
-		"tool":    "xmpp",
-		"summary": "Minimal XMPP client optimized for agents and terminal discovery",
-		"usage":   "xmpp [global flags] <command> [command args]",
-		"flags": []map[string]string{
-			{"name": "--host HOST", "summary": "XMPP server host; default XMPP_HOST or JID domain"},
-			{"name": "--port N", "summary": "XMPP client port; default 5222 or XMPP_PORT"},
-			{"name": "--jid JID", "summary": "account JID local@domain[/resource]; default XMPP_JID"},
-			{"name": "--password PASS", "summary": "account password; default XMPP_PASS"},
-			{"name": "--resource NAME", "summary": "resource to bind"},
-			{"name": "--to JID", "summary": "recipient for send or ping"},
-			{"name": "--body TEXT", "summary": "message body for send; stdin fallback"},
-			{"name": "--timeout D", "summary": "connect/read timeout"},
-			{"name": "--plaintext", "summary": "disable STARTTLS for local/dev servers"},
-			{"name": "--no-presence", "summary": "do not send available presence after login"},
-		},
-		"commands": []map[string]string{
-			{"name": "connect", "summary": "connect, authenticate, bind resource, then exit", "schema": "connect"},
-			{"name": "send", "summary": "send a chat message", "schema": "send"},
-			{"name": "recv", "summary": "wait for one message with a non-empty body", "schema": "recv"},
-			{"name": "listen", "summary": "stream messages with non-empty bodies until timeout or signal", "schema": "listen"},
-			{"name": "ping", "summary": "send XEP-0199 ping", "schema": "ping"},
-			{"name": "schemas", "summary": "list output schemas", "schema": "schemas"},
-		},
-		"schemas": []string{"help", "schemas", "error", "connect", "send", "recv", "listen", "ping"},
-	})
+	_, err := io.WriteString(out, rootHelp)
+	return err
+}
+
+func printCommandHelp(out io.Writer, cmd string) error {
+	text, ok := commandHelp[cmd]
+	if !ok {
+		return codedWithHint("unknown_command", fmt.Sprintf("unknown command %q", cmd), "Run \"xmpp help\" to list available commands.")
+	}
+	_, err := io.WriteString(out, text)
+	return err
+}
+
+const rootHelp = `xmpp — minimal XMPP client optimized for agents and terminal discovery
+
+USAGE
+  xmpp [global flags] <command> [command args]
+  xmpp help [command]
+  xmpp <command> --help
+
+COMMANDS
+  connect  Connect, authenticate, bind a resource, then exit.
+  send     Send a chat message.
+  recv     Wait for one message with a non-empty body.
+  listen   Stream messages with non-empty bodies until timeout or signal.
+  ping     Send an XEP-0199 ping.
+  schemas  List structured output schema IDs and file paths.
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --to JID          recipient for send or ping (default: none)
+  --body TEXT       message body for send; stdin fallback when omitted (default: stdin)
+  --timeout D       connect/read timeout as a Go duration (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: commands emit YAML documents matching their schema ID; listen emits a YAML stream.
+  stderr: failures emit the standard YAML error envelope with code and message.
+  discovery: run "xmpp schemas" for structured schema IDs and file paths.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --to bob@example.test --body "hello" send
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --timeout 0 listen
+
+SEE ALSO
+  xmpp schemas
+`
+
+var commandHelp = map[string]string{
+	"connect": `USAGE
+  xmpp [connection flags] connect
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --timeout D       connect/read timeout as a Go duration (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: YAML connect result document with connected: true; see "xmpp schemas" → connect.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" connect
+`,
+	"send": `USAGE
+  xmpp [connection flags] [--to JID] [--body TEXT] send [recipient] [body]
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --to JID          recipient JID; may be replaced by first positional arg (default: none)
+  --body TEXT       message body; stdin fallback when omitted (default: stdin)
+  --timeout D       connect/read timeout as a Go duration (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: YAML send result document with sent and to fields; see "xmpp schemas" → send.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --to bob@example.test --body "hello" send
+`,
+	"recv": `USAGE
+  xmpp [connection flags] recv
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --timeout D       connect/read timeout as a Go duration (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: YAML message document for one received body; see "xmpp schemas" → recv.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --timeout 30s recv
+`,
+	"listen": `USAGE
+  xmpp [connection flags] listen
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --timeout D       listen deadline as a Go duration; --timeout 0 listens until SIGINT/SIGTERM (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: YAML stream of message documents, one per non-empty body; see "xmpp schemas" → listen.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --timeout 0 listen
+`,
+	"ping": `USAGE
+  xmpp [connection flags] [--to JID] ping [target]
+
+FLAGS
+  --host HOST       XMPP server host (default: XMPP_HOST or JID domain)
+  --port N          XMPP client port (default: XMPP_PORT or 5222)
+  --jid JID         account JID local@domain[/resource] (default: XMPP_JID)
+  --password PASS   account password (default: XMPP_PASS)
+  --resource NAME   resource to bind (default: XMPP_RESOURCE or xmpp-go)
+  --to JID          ping target; defaults to the account domain when omitted (default: none)
+  --timeout D       connect/read timeout as a Go duration (default: 15s)
+  --plaintext       disable STARTTLS for local/dev servers (default: false)
+  --no-presence     do not send available presence after login (default: false)
+
+OUTPUT
+  stdout: YAML ping result document with id and ok fields; see "xmpp schemas" → ping.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp --jid alice@example.test --password "$XMPP_PASS" --to example.test ping
+`,
+	"schemas": `USAGE
+  xmpp schemas
+
+FLAGS
+  (none)
+
+OUTPUT
+  stdout: YAML schema discovery document with tool and schemas fields; see "xmpp schemas" → schemas.
+  stderr: standard YAML error envelope with code and message.
+
+EXAMPLES
+  xmpp schemas
+`,
 }

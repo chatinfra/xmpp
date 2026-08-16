@@ -214,9 +214,69 @@ func TestClientSurfacesStaleSession(t *testing.T) {
 	if !IsStaleSession(err) {
 		t.Fatalf("IsStaleSession=false err=%v", err)
 	}
+	if !IsSessionInvalid(err) {
+		t.Fatalf("IsSessionInvalid=false err=%v", err)
+	}
 	var stale *StaleSessionError
 	if !errors.As(err, &stale) || stale.SessionID != "ses-old" {
 		t.Fatalf("stale=%+v err=%v", stale, err)
+	}
+}
+
+func TestClientClassifiesSessionInvalidServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/session/ses-old/message" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		http.Error(w, `{"name":"UnknownError"}`, http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := New(Config{BaseURL: server.URL, Directory: "/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.SubmitPrompt(context.Background(), "ses-old", "hello")
+	if IsStaleSession(err) {
+		t.Fatalf("IsStaleSession=true err=%v", err)
+	}
+	if !IsSessionInvalid(err) {
+		t.Fatalf("IsSessionInvalid=false err=%v", err)
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusInternalServerError || !strings.Contains(httpErr.Body, "UnknownError") {
+		t.Fatalf("httpErr=%+v err=%v", httpErr, err)
+	}
+}
+
+func TestClientDoesNotMisclassifyTransientOrFatalErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "session message server error without unknown error",
+			err:  &HTTPError{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error", Method: http.MethodPost, Path: "/session/ses-1/message", Body: `{"name":"TemporaryFailure"}`},
+		},
+		{
+			name: "session create unknown error",
+			err:  &HTTPError{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error", Method: http.MethodPost, Path: "/session", Body: `{"name":"UnknownError"}`},
+		},
+		{
+			name: "event stream unknown error",
+			err:  &HTTPError{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error", Method: http.MethodGet, Path: "/event", Body: `{"name":"UnknownError"}`},
+		},
+		{
+			name: "bad request without stale signal",
+			err:  &HTTPError{StatusCode: http.StatusBadRequest, Status: "400 Bad Request", Method: http.MethodPost, Path: "/session/ses-1/message", Body: `{"name":"ValidationError"}`},
+		},
+		{name: "generic", err: errors.New("boom")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if IsSessionInvalid(tc.err) {
+				t.Fatalf("IsSessionInvalid=true err=%v", tc.err)
+			}
+		})
 	}
 }
 

@@ -96,6 +96,10 @@ func TestSendChatStateComposingEscapesDestination(t *testing.T) {
 }
 
 func captureClientWrite(t *testing.T, write func(*Client) error) string {
+	return captureClientWriteUntil(t, "</message>", write)
+}
+
+func captureClientWriteUntil(t *testing.T, marker string, write func(*Client) error) string {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -105,7 +109,7 @@ func captureClientWrite(t *testing.T, write func(*Client) error) string {
 		err    error
 	}, 1)
 	go func() {
-		stanza, err := readUntilString(bufio.NewReader(serverConn), "</message>")
+		stanza, err := readUntilString(bufio.NewReader(serverConn), marker)
 		readDone <- struct {
 			stanza string
 			err    error

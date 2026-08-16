@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,8 @@ type Client struct {
 	reader   *bufio.Reader
 	decoder  *xml.Decoder
 	features Features
+	writeMu  sync.Mutex
+	seqMu    sync.Mutex
 	seq      int
 }
 
@@ -73,10 +76,19 @@ type Features struct {
 }
 
 type Message struct {
-	From string `json:"from,omitempty"`
-	To   string `json:"to,omitempty"`
-	Type string `json:"type,omitempty"`
-	Body string `json:"body"`
+	ID           string                `json:"id,omitempty"`
+	From         string                `json:"from,omitempty"`
+	To           string                `json:"to,omitempty"`
+	Type         string                `json:"type,omitempty"`
+	Body         string                `json:"body"`
+	Delay        *Delay                `json:"delay,omitempty"`
+	AgentMessage *AgentMessageMetadata `json:"agentMessage,omitempty"`
+	MetadataErr  string                `json:"-"`
+}
+
+type Event struct {
+	Message  *Message
+	Presence *OccupantPresence
 }
 
 type PingResult struct {
@@ -192,18 +204,16 @@ func (c *Client) Close() error {
 	if c.conn == nil {
 		return nil
 	}
-	_, _ = io.WriteString(c.conn, "</stream:stream>")
+	_ = c.writeStanza("</stream:stream>")
 	return c.conn.Close()
 }
 
 func (c *Client) SendPresence() error {
-	_, err := io.WriteString(c.conn, "<presence/>")
-	return err
+	return c.writeStanza("<presence/>")
 }
 
 func (c *Client) SendMessage(to, body string) error {
-	stanza := fmt.Sprintf("<message to='%s' type='chat'><body>%s</body></message>", xmlEscape(to), xmlEscape(body))
-	_, err := io.WriteString(c.conn, stanza)
+	_, err := c.sendMessage(to, "chat", body, nil)
 	return err
 }
 
@@ -212,8 +222,7 @@ func (c *Client) SendChatState(to string, state ChatState) error {
 		return fmt.Errorf("unsupported xmpp chat state %q", state)
 	}
 	stanza := fmt.Sprintf("<message to='%s' type='chat'><%s xmlns='%s'/></message>", xmlEscape(to), state, chatStateNamespace)
-	_, err := io.WriteString(c.conn, stanza)
-	return err
+	return c.writeStanza(stanza)
 }
 
 func (s ChatState) valid() bool {
@@ -252,25 +261,38 @@ func (c *Client) Ping(ctx context.Context, to string) (*PingResult, error) {
 
 func (c *Client) ReceiveMessage(ctx context.Context) (*Message, error) {
 	for {
+		event, err := c.ReceiveEvent(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if event.Message != nil && event.Message.Body != "" {
+			return event.Message, nil
+		}
+	}
+}
+
+func (c *Client) ReceiveEvent(ctx context.Context) (Event, error) {
+	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return Event{}, ctx.Err()
 		default:
 		}
 		tok, err := c.receiveToken(ctx)
 		if err != nil {
-			return nil, err
+			return Event{}, err
 		}
 		start, ok := tok.(xml.StartElement)
-		if !ok || start.Name.Local != "message" {
+		if !ok {
 			continue
 		}
-		msg, err := decodeMessage(c.decoder, start)
-		if err != nil {
-			return nil, err
-		}
-		if msg.Body != "" {
-			return &msg, nil
+		switch start.Name.Local {
+		case "message":
+			msg, err := decodeMessage(c.decoder, start)
+			return Event{Message: &msg}, err
+		case "presence":
+			presence, err := decodeOccupantPresence(c.decoder, start)
+			return Event{Presence: &presence}, err
 		}
 	}
 }
@@ -285,6 +307,21 @@ func (c *Client) StreamMessages(ctx context.Context, yield func(*Message) error)
 			return err
 		}
 		if err := yield(msg); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) StreamEvents(ctx context.Context, yield func(Event) error) error {
+	for {
+		event, err := c.ReceiveEvent(ctx)
+		if err != nil {
+			if receiveEndedByContext(ctx, err) {
+				return nil
+			}
+			return err
+		}
+		if err := yield(event); err != nil {
 			return err
 		}
 	}
@@ -415,6 +452,8 @@ func (c *Client) resetDecoder() {
 }
 
 func (c *Client) nextID(prefix string) string {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
 	c.seq++
 	return fmt.Sprintf("%s_%d", prefix, c.seq)
 }
@@ -509,7 +548,7 @@ func decodeFeatures(decoder *xml.Decoder, start xml.StartElement) (Features, err
 }
 
 func decodeMessage(decoder *xml.Decoder, start xml.StartElement) (Message, error) {
-	msg := Message{From: attr(start, "from"), To: attr(start, "to"), Type: attr(start, "type")}
+	msg := Message{ID: attr(start, "id"), From: attr(start, "from"), To: attr(start, "to"), Type: attr(start, "type")}
 	for {
 		tok, err := decoder.Token()
 		if err != nil {
@@ -517,8 +556,29 @@ func decodeMessage(decoder *xml.Decoder, start xml.StartElement) (Message, error
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "body" {
+			switch {
+			case t.Name.Local == "body":
 				if err := decoder.DecodeElement(&msg.Body, &t); err != nil {
+					return msg, err
+				}
+			case isDelayElement(t):
+				delay, err := decodeDelay(decoder, t)
+				if err != nil {
+					return msg, err
+				}
+				msg.Delay = &delay
+			case t.Name.Local == "agent-message" && t.Name.Space == agentMessageNamespace:
+				metadata, err := decodeAgentMessage(decoder, t)
+				if msg.AgentMessage != nil || msg.MetadataErr != "" {
+					msg.AgentMessage = nil
+					msg.MetadataErr = "message contains multiple agent-message elements"
+				} else if err != nil {
+					msg.MetadataErr = err.Error()
+				} else {
+					msg.AgentMessage = &metadata
+				}
+			default:
+				if err := decoder.Skip(); err != nil {
 					return msg, err
 				}
 			}
@@ -528,6 +588,13 @@ func decodeMessage(decoder *xml.Decoder, start xml.StartElement) (Message, error
 			}
 		}
 	}
+}
+
+func (c *Client) writeStanza(stanza string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, err := io.WriteString(c.conn, stanza)
+	return err
 }
 
 func attr(start xml.StartElement, name string) string {

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestJSONFlagRejectedWithYAMLError(t *testing.T) {
@@ -30,18 +32,166 @@ func TestJSONFlagRejectedWithYAMLError(t *testing.T) {
 	}
 }
 
-func TestHelpOptimizedForDiscovery(t *testing.T) {
-	var out, errOut bytes.Buffer
-	if err := Run([]string{"--help"}, &out, &errOut); err != nil {
+func TestRootHelpHasSections(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "long flag", args: []string{"--help"}},
+		{name: "help command", args: []string{"help"}},
+		{name: "bare", args: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, err := runCLI(t, tc.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stderr != "" {
+				t.Fatalf("stderr = %q; want empty", stderr)
+			}
+			for _, header := range []string{"USAGE", "COMMANDS", "FLAGS", "OUTPUT", "EXAMPLES"} {
+				if !hasHeader(stdout, header) {
+					t.Fatalf("help missing %s header:\n%s", header, stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestRootHelpListsAllCommands(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "help")
+	if err != nil {
 		t.Fatal(err)
 	}
-	requireYAMLStdout(t, out.String(), errOut.String(), "help.schema.yaml")
-	out.Reset()
-	errOut.Reset()
-	if err := Run([]string{"schemas"}, &out, &errOut); err != nil {
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty", stderr)
+	}
+	for _, cmd := range []string{"connect", "send", "recv", "listen", "ping", "schemas"} {
+		if !commandLineHasSummary(stdout, cmd) {
+			t.Fatalf("COMMANDS section missing %q with summary:\n%s", cmd, stdout)
+		}
+	}
+}
+
+func TestRootHelpFlagsShowEnvDefaults(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "--help")
+	if err != nil {
 		t.Fatal(err)
 	}
-	requireYAMLStdout(t, out.String(), errOut.String(), "schemas.schema.yaml")
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty", stderr)
+	}
+	for flagName, want := range map[string]string{
+		"--jid":      "XMPP_JID",
+		"--port":     "XMPP_PORT",
+		"--password": "XMPP_PASS",
+		"--host":     "XMPP_HOST",
+		"--resource": "XMPP_RESOURCE",
+	} {
+		line := lineContaining(sectionLines(stdout, "FLAGS"), flagName)
+		if line == "" || !strings.Contains(line, want) {
+			t.Fatalf("FLAGS line for %s = %q; want inline %s in:\n%s", flagName, line, want, stdout)
+		}
+	}
+}
+
+func TestRootHelpIsNotOldYAMLShape(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty", stderr)
+	}
+
+	var doc any
+	if err := yaml.Unmarshal([]byte(stdout), &doc); err != nil {
+		return
+	}
+	root, ok := normalizeYAML(doc).(map[string]any)
+	if !ok {
+		return
+	}
+	for _, key := range []string{"commands", "flags", "schemas"} {
+		if _, ok := root[key]; ok {
+			t.Fatalf("help parsed as old YAML key %q: %#v\n%s", key, root, stdout)
+		}
+	}
+}
+
+func TestPerCommandHelp(t *testing.T) {
+	for _, cmd := range []string{"connect", "send", "recv", "listen", "ping", "schemas"} {
+		for _, args := range [][]string{{"help", cmd}, {cmd, "--help"}} {
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				stdout, stderr, err := runCLI(t, args...)
+				if err != nil {
+					t.Fatalf("Run(%v) error = %v; stderr=%s", args, err, stderr)
+				}
+				if stderr != "" {
+					t.Fatalf("stderr = %q; want empty", stderr)
+				}
+				for _, header := range []string{"USAGE", "FLAGS", "OUTPUT", "EXAMPLES"} {
+					if !hasHeader(stdout, header) {
+						t.Fatalf("%s help missing %s header:\n%s", cmd, header, stdout)
+					}
+				}
+				if !strings.Contains(stdout, "→ "+cmd) {
+					t.Fatalf("%s help missing schema reference:\n%s", cmd, stdout)
+				}
+			})
+		}
+	}
+}
+
+func TestListenHelpDocumentsTimeoutZero(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "listen", "--help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q; want empty", stderr)
+	}
+	if !strings.Contains(stdout, "--timeout 0 listens until SIGINT/SIGTERM") {
+		t.Fatalf("listen help missing indefinite timeout behavior:\n%s", stdout)
+	}
+}
+
+func TestUnknownCommandHelpReturnsYAMLErrorWithHint(t *testing.T) {
+	for _, args := range [][]string{{"help", "bogus"}, {"bogus", "--help"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout, stderr, err := runCLI(t, args...)
+			if err == nil {
+				t.Fatalf("Run(%v) succeeded; want error", args)
+			}
+			doc := requireYAMLError(t, stdout, stderr, "error.schema.yaml")
+			envelope, ok := doc.(map[string]any)["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("error envelope missing: %#v", doc)
+			}
+			if envelope["code"] != "unknown_command" {
+				t.Fatalf("code = %#v; want unknown_command", envelope["code"])
+			}
+			hint, _ := envelope["hint"].(string)
+			if !strings.Contains(hint, "xmpp help") {
+				t.Fatalf("hint = %q; want xmpp help", hint)
+			}
+		})
+	}
+}
+
+func TestSchemasCommandStillDiscoversListenSchema(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "schemas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemasDoc := requireYAMLStdout(t, stdout, stderr, "schemas.schema.yaml")
+	requireSchemaDiscoveryPaths(t, schemasDoc)
+	if !hasSchemaEntry(t, schemasDoc, "listen", "spec/outputs/listen.schema.yaml") {
+		t.Fatalf("schemas output missing listen entry: %#v", schemasDoc)
+	}
+	if hasSchemaEntry(t, schemasDoc, "help", "spec/outputs/help.schema.yaml") {
+		t.Fatalf("schemas output advertises terminal help schema: %#v", schemasDoc)
+	}
 }
 
 func TestConfigErrorsAreYAML(t *testing.T) {
@@ -170,12 +320,74 @@ func TestSuccessSchemas(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout bytes.Buffer
-			if err := write(&stdout, false, tc.value, ""); err != nil {
+			if err := writeYAMLResult(&stdout, tc.value); err != nil {
 				t.Fatal(err)
 			}
 			requireYAMLStdout(t, stdout.String(), "", tc.schema)
 		})
 	}
+}
+
+func runCLI(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	err := Run(args, &stdout, &stderr)
+	return stdout.String(), stderr.String(), err
+}
+
+func hasHeader(text, header string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == header {
+			return true
+		}
+	}
+	return false
+}
+
+func commandLineHasSummary(text, command string) bool {
+	line := lineContaining(sectionLines(text, "COMMANDS"), command)
+	if line == "" {
+		return false
+	}
+	fields := strings.Fields(line)
+	return len(fields) > 1 && fields[0] == command
+}
+
+func sectionLines(text, header string) []string {
+	var lines []string
+	inSection := false
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == header {
+			inSection = true
+			continue
+		}
+		if inSection && isSectionHeader(trimmed) {
+			break
+		}
+		if inSection && trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
+func isSectionHeader(line string) bool {
+	switch line {
+	case "USAGE", "COMMANDS", "FLAGS", "ENVIRONMENT", "OUTPUT", "EXAMPLES", "SEE ALSO":
+		return true
+	default:
+		return false
+	}
+}
+
+func lineContaining(lines []string, token string) string {
+	for _, line := range lines {
+		if strings.Contains(line, token) {
+			return line
+		}
+	}
+	return ""
 }
 
 type fakeXMPPOptions struct {

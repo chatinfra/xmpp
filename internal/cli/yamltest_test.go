@@ -57,8 +57,12 @@ func TestListenOutputSchemaAndDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	schemasDoc := requireYAMLStdout(t, stdout.String(), stderr.String(), "schemas.schema.yaml")
+	requireSchemaDiscoveryPaths(t, schemasDoc)
 	if !hasSchemaEntry(t, schemasDoc, "listen", "spec/outputs/listen.schema.yaml") {
 		t.Fatalf("schemas output missing listen entry: %#v", schemasDoc)
+	}
+	if hasSchemaEntry(t, schemasDoc, "help", "spec/outputs/help.schema.yaml") {
+		t.Fatalf("schemas output advertises terminal help schema: %#v", schemasDoc)
 	}
 
 	stdout.Reset()
@@ -66,12 +70,14 @@ func TestListenOutputSchemaAndDiscovery(t *testing.T) {
 	if err := Run([]string{"help"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	helpDoc := requireYAMLStdout(t, stdout.String(), stderr.String(), "help.schema.yaml")
-	if !hasCommandEntry(t, helpDoc, "listen", "listen") {
-		t.Fatalf("help output missing listen command: %#v", helpDoc)
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q; want empty stderr for help", stderr.String())
 	}
-	if !hasSchemaID(t, helpDoc, "listen") {
-		t.Fatalf("help output missing listen schema id: %#v", helpDoc)
+	if !commandLineHasSummary(stdout.String(), "listen") {
+		t.Fatalf("help output missing listen command summary:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "schema: listen") {
+		t.Fatalf("help output embeds listen schema mapping:\n%s", stdout.String())
 	}
 }
 
@@ -142,44 +148,34 @@ func hasSchemaEntry(t *testing.T, doc any, id, path string) bool {
 	return false
 }
 
-func hasCommandEntry(t *testing.T, doc any, name, schema string) bool {
+func requireSchemaDiscoveryPaths(t *testing.T, doc any) {
 	t.Helper()
 	root, ok := doc.(map[string]any)
 	if !ok {
-		t.Fatalf("help doc = %#v; want map", doc)
-	}
-	commands, ok := root["commands"].([]any)
-	if !ok {
-		t.Fatalf("commands field = %#v; want list", root["commands"])
-	}
-	for _, item := range commands {
-		entry, ok := item.(map[string]any)
-		if !ok {
-			t.Fatalf("command entry = %#v; want map", item)
-		}
-		if entry["name"] == name && entry["schema"] == schema {
-			return true
-		}
-	}
-	return false
-}
-
-func hasSchemaID(t *testing.T, doc any, id string) bool {
-	t.Helper()
-	root, ok := doc.(map[string]any)
-	if !ok {
-		t.Fatalf("help doc = %#v; want map", doc)
+		t.Fatalf("schemas doc = %#v; want map", doc)
 	}
 	schemas, ok := root["schemas"].([]any)
 	if !ok {
 		t.Fatalf("schemas field = %#v; want list", root["schemas"])
 	}
+	moduleRoot := yamlTestModuleRoot(t)
 	for _, item := range schemas {
-		if item == id {
-			return true
+		entry, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("schema entry = %#v; want map", item)
+		}
+		id, _ := entry["id"].(string)
+		path, _ := entry["path"].(string)
+		if id == "" || path == "" {
+			t.Fatalf("schema entry missing id or path: %#v", entry)
+		}
+		if !strings.HasPrefix(path, "spec/outputs/") {
+			t.Fatalf("schema path %q for id %q is outside spec/outputs", path, id)
+		}
+		if _, err := os.Stat(filepath.Join(moduleRoot, filepath.FromSlash(path))); err != nil {
+			t.Fatalf("schema path %q for id %q does not exist: %v", path, id, err)
 		}
 	}
-	return false
 }
 
 func validateYAMLSchema(t *testing.T, doc any, schemaPath string) {
